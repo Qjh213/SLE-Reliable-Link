@@ -1,0 +1,9 @@
+SLE Reliable Link
+
+This project contains modifications of the SLE UART sample from the
+BearPi-Pico H3863 / HiSilicon WS63 SDK.
+
+Original source files retain the following copyright notice:
+Copyright (c) HiSilicon (Shanghai) Technologies Co., Ltd. 2023-2023.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.

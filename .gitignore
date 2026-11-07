@@ -1,0 +1,19 @@
+# Build outputs
+output/
+build/
+*.bin
+*.elf
+*.map
+*.o
+*.obj
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
+QCOM_LOG_*.txt
+
