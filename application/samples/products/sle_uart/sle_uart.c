@@ -20,6 +20,7 @@
 #include "sle_uart_server_adv.h"
 #include "sle_device_discovery.h"
 #include "sle_errcode.h"
+#include "sle_rl_board_led.h"
 #elif defined(CONFIG_SAMPLE_SUPPORT_SLE_UART_CLIENT)
 #define SLE_UART_TASK_STACK_SIZE            0x600
 #include "sle_connection_manager.h"
@@ -108,6 +109,13 @@ static volatile uint32_t g_sle_rl_tx_error = 0;
 static volatile uint32_t g_sle_rl_command_rx = 0;
 static volatile uint32_t g_sle_rl_parse_error = 0;
 static volatile uint32_t g_sle_rl_ack_seq = 0;
+static volatile bool g_sle_rl_led_ready = false;
+static bool g_sle_rl_last_command_valid = false;
+static uint32_t g_sle_rl_last_command_seq = 0;
+static uint8_t g_sle_rl_last_command = 0;
+static uint8_t g_sle_rl_last_ack_status = SLE_RL_ACK_INTERNAL_ERROR;
+static uint8_t g_sle_rl_last_ack_extra[SLE_RL_MAX_PAYLOAD_LEN - 6] = {0};
+static uint16_t g_sle_rl_last_ack_extra_len = 0;
 static osal_semaphore g_sle_rl_tx_sem;
 static volatile bool g_sle_rl_tx_sem_ready = false;
 
@@ -153,6 +161,15 @@ static void sle_rl_server_process_command(const sle_rl_frame_view_t *view)
     }
 
     uint8_t command = view->payload[0];
+    if (g_sle_rl_last_command_valid && (view->seq == g_sle_rl_last_command_seq) &&
+        (command == g_sle_rl_last_command)) {
+        osal_printk("[RL][COMMAND_DUPLICATE] seq=%u command=%u action=RESEND_ACK\r\n",
+            view->seq, command);
+        sle_rl_server_send_ack(view->seq, command, g_sle_rl_last_ack_status,
+            g_sle_rl_last_ack_extra, g_sle_rl_last_ack_extra_len);
+        return;
+    }
+
     uint8_t ack_status = SLE_RL_ACK_OK;
     uint8_t extra[SLE_RL_MAX_PAYLOAD_LEN - 6] = {0};
     uint16_t extra_len = 0;
@@ -218,6 +235,30 @@ static void sle_rl_server_process_command(const sle_rl_frame_view_t *view)
                 (void)memcpy_s(extra, sizeof(extra), &view->payload[1], extra_len);
             }
             break;
+        case SLE_RL_CMD_LED_ON:
+        case SLE_RL_CMD_LED_OFF:
+        case SLE_RL_CMD_LED_TOGGLE:
+        case SLE_RL_CMD_GET_LED_STATUS:
+            if (view->payload_len != 1) {
+                ack_status = SLE_RL_ACK_BAD_LENGTH;
+            } else if (!g_sle_rl_led_ready) {
+                ack_status = SLE_RL_ACK_INTERNAL_ERROR;
+            } else {
+                bool operation_ok = true;
+                if (command == SLE_RL_CMD_LED_ON) {
+                    operation_ok = sle_rl_board_led_set(true);
+                } else if (command == SLE_RL_CMD_LED_OFF) {
+                    operation_ok = sle_rl_board_led_set(false);
+                } else if (command == SLE_RL_CMD_LED_TOGGLE) {
+                    operation_ok = sle_rl_board_led_toggle();
+                }
+                if (!operation_ok) {
+                    ack_status = SLE_RL_ACK_INTERNAL_ERROR;
+                }
+                extra[0] = sle_rl_board_led_is_on() ? 1U : 0U;
+                extra_len = 1;
+            }
+            break;
         default:
             ack_status = SLE_RL_ACK_UNKNOWN_COMMAND;
             break;
@@ -225,6 +266,14 @@ static void sle_rl_server_process_command(const sle_rl_frame_view_t *view)
 
     osal_printk("[RL][COMMAND] seq=%u command=%u len=%u status=%u\r\n",
         view->seq, command, view->payload_len, ack_status);
+    g_sle_rl_last_command_valid = true;
+    g_sle_rl_last_command_seq = view->seq;
+    g_sle_rl_last_command = command;
+    g_sle_rl_last_ack_status = ack_status;
+    g_sle_rl_last_ack_extra_len = extra_len;
+    if (extra_len > 0) {
+        (void)memcpy_s(g_sle_rl_last_ack_extra, sizeof(g_sle_rl_last_ack_extra), extra, extra_len);
+    }
     sle_rl_server_send_ack(view->seq, command, ack_status, extra, extra_len);
 }
 
@@ -497,6 +546,11 @@ void sle_uart_indication_cb(uint8_t client_id, uint16_t conn_id,
 static void sle_uart_client_read_int_handler(const void *buffer, uint16_t length, bool error)
 {
     unused(error);
+    if (sle_rl_client_manual_enabled()) {
+        /* 手动控制模式：串口输入的字符交给客户端任务解析成 LED 命令 */
+        sle_rl_client_manual_feed((const uint8_t *)buffer, length);
+        return;
+    }
     ssapc_write_param_t *sle_uart_send_param = get_g_sle_uart_send_param();
     uint16_t g_sle_uart_conn_id = get_g_sle_uart_conn_id();
     sle_uart_send_param->data_len = length;
@@ -533,6 +587,11 @@ static void sle_uart_entry(void)
     osal_task *task_handle = NULL;
 #if defined(CONFIG_SAMPLE_SUPPORT_SLE_UART_SERVER)
     osal_task *rl_task_handle = NULL;
+    g_sle_rl_led_ready = sle_rl_board_led_init();
+    osal_printk("[RL][LED_INIT] pin=%u active_low=%u state=%s result=%s\r\n",
+        CONFIG_SLE_RL_LED_PIN, CONFIG_SLE_RL_LED_ACTIVE_LOW,
+        g_sle_rl_led_ready && sle_rl_board_led_is_on() ? "ON" : "OFF",
+        g_sle_rl_led_ready ? "PASS" : "FAIL");
     if (osal_sem_init(&g_sle_rl_tx_sem, 1) == OSAL_SUCCESS) {
         g_sle_rl_tx_sem_ready = true;
     } else {

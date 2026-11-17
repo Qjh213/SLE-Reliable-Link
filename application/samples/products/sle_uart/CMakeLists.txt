@@ -7,6 +7,7 @@ set(SOURCES_LIST
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_server/sle_uart_server_adv.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_server/sle_uart_server.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_reliable_link/sle_rl_protocol.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/sle_reliable_link/sle_rl_board_led.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart.c
 )
 set(HEADER_LIST

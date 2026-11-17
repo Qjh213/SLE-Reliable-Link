@@ -41,3 +41,19 @@ config SUPPORT_SLE_PERIPHERAL
 config SUPPORT_SLE_CENTRAL
     bool
     default y if (SAMPLE_SUPPORT_SLE_UART_CLIENT)
+
+config SLE_RL_LED_PIN
+    int "Reliable-link on-board LED GPIO"
+    default 2
+    depends on SAMPLE_SUPPORT_SLE_UART_SERVER
+    help
+        GPIO2 drives the blue user LED on BearPi-Pico H3863.
+
+config SLE_RL_LED_ACTIVE_LOW
+    int "Reliable-link LED active-low flag (1: active low, 0: active high)"
+    range 0 1
+    default 0
+    depends on SAMPLE_SUPPORT_SLE_UART_SERVER
+    help
+        BearPi-Pico H3863 lights the on-board blue LED with a high level
+        (verified on hardware: GPIO2 high = on, low = off).

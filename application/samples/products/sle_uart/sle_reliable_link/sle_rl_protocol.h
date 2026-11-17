@@ -34,6 +34,10 @@ typedef enum {
     SLE_RL_CMD_GET_STATUS = 0x04,
     SLE_RL_CMD_RESET_STATS = 0x05,
     SLE_RL_CMD_PING = 0x06,
+    SLE_RL_CMD_LED_ON = 0x10,
+    SLE_RL_CMD_LED_OFF = 0x11,
+    SLE_RL_CMD_LED_TOGGLE = 0x12,
+    SLE_RL_CMD_GET_LED_STATUS = 0x13,
 } sle_rl_command_t;
 
 typedef enum {

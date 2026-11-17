@@ -48,8 +48,22 @@
 #define SLE_RL_TEST_PERIOD_MS           100U
 #define SLE_RL_TEST_MODE_FUNCTIONAL     1
 #define SLE_RL_TEST_MODE_RECOVERY       2
-#define SLE_RL_TEST_MODE                SLE_RL_TEST_MODE_RECOVERY
+#define SLE_RL_TEST_MODE                SLE_RL_TEST_MODE_FUNCTIONAL
 #define SLE_RL_RECOVERY_FRAME_COUNT     100U
+#define SLE_RL_LED_CONTROL_COUNT         100U
+#define SLE_RL_STATUS_EXTRA_LEN          17U
+
+/* 1: 串口手动控制 LED（上电后不跑自动测试）；0: 上电自动跑功能/可靠性测试 */
+#define SLE_RL_MANUAL_CONTROL_ENABLE     1
+#define SLE_RL_MANUAL_BUF_SIZE           32U
+
+/* 手动模式只在 FUNCTIONAL 配置下编译；RECOVERY 配置下完全不引用手动控制符号，
+ * 避免 -Wall -Werror 把未使用的 static 函数报成错误。 */
+#if (SLE_RL_MANUAL_CONTROL_ENABLE != 0) && (SLE_RL_TEST_MODE == SLE_RL_TEST_MODE_FUNCTIONAL)
+#define SLE_RL_MANUAL_MODE               1
+#else
+#define SLE_RL_MANUAL_MODE               0
+#endif
 
 static ssapc_find_service_result_t g_sle_uart_find_service_result = { 0 };
 static sle_announce_seek_callbacks_t g_sle_uart_seek_cbk = { 0 };
@@ -92,6 +106,10 @@ static volatile uint32_t g_sle_rl_rx_crc_error = 0;
 static volatile uint32_t g_sle_rl_rx_content_error = 0;
 static volatile uint32_t g_sle_rl_expected_telemetry_seq = 0;
 static volatile bool g_sle_rl_have_telemetry_seq = false;
+static volatile bool g_sle_rl_last_led_state_valid = false;
+static volatile bool g_sle_rl_last_led_on = false;
+static volatile bool g_sle_rl_last_status_valid = false;
+static uint8_t g_sle_rl_last_status[SLE_RL_STATUS_EXTRA_LEN] = {0};
 
 
 static void sle_uart_client_connect_param_update_req_cbk(uint16_t conn_id, errcode_t status,
@@ -176,6 +194,12 @@ bool sle_rl_client_handle_notification(const uint8_t *data, uint16_t len)
             g_sle_rl_rx_out_of_order++;
         }
         g_sle_rl_rx_total++;
+        if (sle_rl_client_manual_enabled()) {
+            osal_printk("[RL][MANUAL] telemetry seq=%u uptime_ms=%u period_ms=%u "
+                "tx_ok=%u tx_error=%u\r\n", view.seq, sle_rl_get_le32(&view.payload[0]),
+                sle_rl_get_le32(&view.payload[8]), sle_rl_get_le32(&view.payload[12]),
+                sle_rl_get_le32(&view.payload[16]));
+        }
         osal_sem_up(&g_sle_rl_telemetry_sem);
         if ((g_sle_rl_rx_total % 100U) == 0) {
             osal_printk("[RL][CLIENT_SUMMARY] rx=%u lost=%u duplicate=%u out_of_order=%u "
@@ -194,6 +218,27 @@ bool sle_rl_client_handle_notification(const uint8_t *data, uint16_t len)
         uint8_t command = view.payload[0];
         uint8_t ack_status = view.payload[1];
         uint32_t command_seq = sle_rl_get_le32(&view.payload[2]);
+        bool is_led_command = (command == SLE_RL_CMD_LED_ON) ||
+            (command == SLE_RL_CMD_LED_OFF) ||
+            (command == SLE_RL_CMD_LED_TOGGLE) ||
+            (command == SLE_RL_CMD_GET_LED_STATUS);
+        if (is_led_command && (ack_status == SLE_RL_ACK_OK)) {
+            if (view.payload_len < 7U) {
+                g_sle_rl_rx_content_error++;
+                osal_printk("[RL][ERROR] reason=LED_ACK_LENGTH len=%u\r\n", view.payload_len);
+                return true;
+            }
+            g_sle_rl_last_led_on = view.payload[6] != 0U;
+            g_sle_rl_last_led_state_valid = true;
+            osal_printk("[RL][LED_STATE] command_seq=%u state=%s\r\n",
+                command_seq, g_sle_rl_last_led_on ? "ON" : "OFF");
+        }
+        if ((command == SLE_RL_CMD_GET_STATUS) && (ack_status == SLE_RL_ACK_OK) &&
+            (view.payload_len >= (6U + SLE_RL_STATUS_EXTRA_LEN))) {
+            (void)memcpy_s(g_sle_rl_last_status, sizeof(g_sle_rl_last_status),
+                &view.payload[6], SLE_RL_STATUS_EXTRA_LEN);
+            g_sle_rl_last_status_valid = true;
+        }
         osal_printk("[RL][ACK_RX] command_seq=%u command=%u status=%u frame_seq=%u len=%u\r\n",
             command_seq, command, ack_status, view.seq, view.payload_len);
         if (g_sle_latency_active && (command == g_sle_rl_expected_command) &&
@@ -279,6 +324,156 @@ static bool sle_rl_client_send_command(uint8_t command, const uint8_t *param,
 {
     return sle_rl_client_send_command_expect(command, param, param_len, SLE_RL_ACK_OK);
 }
+
+#if SLE_RL_TEST_MODE == SLE_RL_TEST_MODE_FUNCTIONAL
+static bool sle_rl_client_expect_led(uint8_t command, bool expected_on)
+{
+    g_sle_rl_last_led_state_valid = false;
+    bool pass = sle_rl_client_send_command(command, NULL, 0);
+    pass = pass && g_sle_rl_last_led_state_valid &&
+        (g_sle_rl_last_led_on == expected_on);
+    osal_printk("[RL][LED_CONTROL] command=%u expected=%s actual=%s result=%s\r\n",
+        command, expected_on ? "ON" : "OFF",
+        g_sle_rl_last_led_state_valid ? (g_sle_rl_last_led_on ? "ON" : "OFF") : "UNKNOWN",
+        pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static bool sle_rl_client_run_led_control_tests(void)
+{
+    bool pass = sle_rl_client_expect_led(SLE_RL_CMD_LED_OFF, false);
+    pass = sle_rl_client_expect_led(SLE_RL_CMD_LED_OFF, false) && pass;
+    pass = sle_rl_client_expect_led(SLE_RL_CMD_LED_ON, true) && pass;
+    pass = sle_rl_client_expect_led(SLE_RL_CMD_LED_ON, true) && pass;
+    pass = sle_rl_client_expect_led(SLE_RL_CMD_LED_TOGGLE, false) && pass;
+    pass = sle_rl_client_expect_led(SLE_RL_CMD_GET_LED_STATUS, false) && pass;
+
+    bool expected_on = false;
+    uint32_t completed = 0;
+    for (uint32_t i = 0; i < SLE_RL_LED_CONTROL_COUNT; i++) {
+        expected_on = !expected_on;
+        if (!sle_rl_client_expect_led(SLE_RL_CMD_LED_TOGGLE, expected_on)) {
+            break;
+        }
+        completed++;
+    }
+    pass = (completed == SLE_RL_LED_CONTROL_COUNT) && pass;
+    osal_printk("[RL][LED_RELIABILITY_SUMMARY] expected=%u completed=%u final_state=%s result=%s\r\n",
+        SLE_RL_LED_CONTROL_COUNT, completed, expected_on ? "ON" : "OFF",
+        pass ? "PASS" : "FAIL");
+    return pass;
+}
+#endif /* SLE_RL_TEST_MODE == SLE_RL_TEST_MODE_FUNCTIONAL */
+
+/* ---------------- 串口手动控制：敲键 -> 下发 LED 命令 ---------------- */
+static volatile uint8_t g_sle_rl_manual_buf[SLE_RL_MANUAL_BUF_SIZE];
+static volatile uint16_t g_sle_rl_manual_head = 0;
+static volatile uint16_t g_sle_rl_manual_tail = 0;
+
+bool sle_rl_client_manual_enabled(void)
+{
+    return SLE_RL_MANUAL_MODE != 0;
+}
+
+void sle_rl_client_manual_feed(const uint8_t *data, uint16_t len)
+{
+    if ((data == NULL) || (SLE_RL_MANUAL_MODE == 0)) {
+        return;
+    }
+    for (uint16_t i = 0; i < len; i++) {
+        uint16_t next = (uint16_t)((g_sle_rl_manual_head + 1U) % SLE_RL_MANUAL_BUF_SIZE);
+        if (next == g_sle_rl_manual_tail) {
+            break;      /* 缓冲区满，丢弃新字节 */
+        }
+        g_sle_rl_manual_buf[g_sle_rl_manual_head] = data[i];
+        g_sle_rl_manual_head = next;
+    }
+}
+
+#if SLE_RL_MANUAL_MODE
+static int sle_rl_client_manual_pop(void)
+{
+    if (g_sle_rl_manual_head == g_sle_rl_manual_tail) {
+        return -1;
+    }
+    uint8_t ch = g_sle_rl_manual_buf[g_sle_rl_manual_tail];
+    g_sle_rl_manual_tail = (uint16_t)((g_sle_rl_manual_tail + 1U) % SLE_RL_MANUAL_BUF_SIZE);
+    return (int)ch;
+}
+
+static void sle_rl_client_manual_print_led(void)
+{
+    osal_printk("[RL][MANUAL] led=%s\r\n",
+        g_sle_rl_last_led_state_valid ? (g_sle_rl_last_led_on ? "ON" : "OFF") : "UNKNOWN");
+}
+
+static void sle_rl_client_manual_exec(uint8_t ch)
+{
+    switch (ch) {
+        case '1':       /* LED 亮 */
+            (void)sle_rl_client_expect_led(SLE_RL_CMD_LED_ON, true);
+            break;
+        case '0':       /* LED 灭 */
+            (void)sle_rl_client_expect_led(SLE_RL_CMD_LED_OFF, false);
+            break;
+        case 't':       /* 翻转一次 */
+        case 'T':
+            g_sle_rl_last_led_state_valid = false;
+            (void)sle_rl_client_send_command(SLE_RL_CMD_LED_TOGGLE, NULL, 0);
+            sle_rl_client_manual_print_led();
+            break;
+        case '?':       /* 查询 LED 状态 */
+            g_sle_rl_last_led_state_valid = false;
+            (void)sle_rl_client_send_command(SLE_RL_CMD_GET_LED_STATUS, NULL, 0);
+            sle_rl_client_manual_print_led();
+            break;
+        case 'g':       /* 查询链路状态 */
+            g_sle_rl_last_status_valid = false;
+            if (sle_rl_client_send_command(SLE_RL_CMD_GET_STATUS, NULL, 0) &&
+                g_sle_rl_last_status_valid) {
+                osal_printk("[RL][MANUAL] status enabled=%u period_ms=%u telemetry_seq=%u "
+                    "tx_ok=%u tx_error=%u\r\n", g_sle_rl_last_status[0],
+                    sle_rl_get_le32(&g_sle_rl_last_status[1]),
+                    sle_rl_get_le32(&g_sle_rl_last_status[5]),
+                    sle_rl_get_le32(&g_sle_rl_last_status[9]),
+                    sle_rl_get_le32(&g_sle_rl_last_status[13]));
+            } else {
+                osal_printk("[RL][MANUAL] status=UNKNOWN\r\n");
+            }
+            break;
+        case 's':       /* 开始周期遥测 */
+            osal_printk("[RL][MANUAL] telemetry=%s\r\n",
+                sle_rl_client_send_command(SLE_RL_CMD_START, NULL, 0) ? "ON" : "FAIL");
+            break;
+        case 'p':       /* 停止周期遥测 */
+            osal_printk("[RL][MANUAL] telemetry=%s\r\n",
+                sle_rl_client_send_command(SLE_RL_CMD_STOP, NULL, 0) ? "OFF" : "FAIL");
+            break;
+        case 'r':       /* 清零统计 */
+            osal_printk("[RL][MANUAL] stats_reset=%s\r\n",
+                sle_rl_client_send_command(SLE_RL_CMD_RESET_STATS, NULL, 0) ? "OK" : "FAIL");
+            break;
+        default:
+            break;
+    }
+}
+
+static void sle_rl_client_manual_loop(void)
+{
+    osal_printk("[RL][MANUAL] ready: 1=ON 0=OFF t=TOGGLE ?=LED_STATUS g=STATUS "
+        "s=START p=STOP r=RESET_STATS\r\n");
+    while (1) {
+        int ch;
+        while ((ch = sle_rl_client_manual_pop()) >= 0) {
+            if ((ch == '\r') || (ch == '\n') || (ch == ' ') || (ch == '\t')) {
+                continue;
+            }
+            sle_rl_client_manual_exec((uint8_t)ch);
+        }
+        osal_msleep(20);
+    }
+}
+#endif /* SLE_RL_MANUAL_MODE */
 
 #if SLE_RL_TEST_MODE == SLE_RL_TEST_MODE_FUNCTIONAL
 static bool sle_rl_client_submit_raw(const uint8_t *frame, uint16_t frame_len,
@@ -389,6 +584,11 @@ static void *sle_rl_client_recovery_task(const char *arg)
         sle_rl_put_le32(period_param, SLE_RL_TEST_PERIOD_MS);
         bool pass = sle_rl_client_send_command(SLE_RL_CMD_SET_PERIOD,
             period_param, sizeof(period_param));
+        g_sle_rl_last_led_state_valid = false;
+        pass = sle_rl_client_send_command(SLE_RL_CMD_GET_LED_STATUS, NULL, 0) && pass;
+        osal_printk("[RL][RECOVERY_LED_SYNC] cycle=%u state=%s result=%s\r\n", cycle,
+            g_sle_rl_last_led_state_valid ? (g_sle_rl_last_led_on ? "ON" : "OFF") : "UNKNOWN",
+            g_sle_rl_last_led_state_valid ? "PASS" : "FAIL");
         pass = sle_rl_client_send_command(SLE_RL_CMD_START, NULL, 0) && pass;
         pass = sle_rl_client_wait_telemetry(SLE_RL_RECOVERY_FRAME_COUNT,
             SLE_RL_TELEMETRY_TIMEOUT_MS) && pass;
@@ -440,8 +640,14 @@ static void *sle_latency_task(const char *arg)
     osal_printk("[RL][LINK_READY] conn_id=%u handle=%u\r\n",
         g_sle_uart_conn_id, g_sle_uart_send_param.handle);
 
+#if SLE_RL_MANUAL_MODE
+    sle_rl_client_manual_loop();
+    return NULL;
+#endif
+
     uint8_t period_param[4] = {0};
     bool pass = true;
+    pass = sle_rl_client_run_led_control_tests() && pass;
     pass = sle_rl_client_send_command(SLE_RL_CMD_GET_STATUS, NULL, 0) && pass;
     pass = sle_rl_client_send_command(SLE_RL_CMD_START, NULL, 0) && pass;
     pass = sle_rl_client_wait_telemetry(SLE_RL_FUNCTIONAL_COUNT,
